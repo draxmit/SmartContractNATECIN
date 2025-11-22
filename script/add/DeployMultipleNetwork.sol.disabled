@@ -1,0 +1,48 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+import "forge-std/Script.sol";
+import "../../src/NatecinFactory.sol";
+import "../../src/VaultRegistry.sol";
+
+contract DeployMultiNetwork is Script {
+
+    struct Net {
+        string rpcAlias;      // e.g. "sepolia"
+        uint256 privateKey;   // PRIVATE_KEY_SEPOLIA
+    }
+
+    function run() external {
+        Net;
+
+        nets[0] = Net("sepolia", vm.envUint("PRIVATE_KEY_SEPOLIA"));
+        nets[1] = Net("arbitrum_sepolia", vm.envUint("PRIVATE_KEY_ARB_SEPOLIA"));
+
+        for (uint256 i = 0; i < nets.length; i++) {
+            deployToNetwork(nets[i]);
+        }
+    }
+
+    function deployToNetwork(Net memory n) internal {
+        console.log("\n====================================");
+        console.log(" Deploying NATECIN to:", n.rpcAlias);
+        console.log("====================================");
+
+        vm.createSelectFork(vm.rpcUrl(n.rpcAlias));
+
+        address deployer = vm.addr(n.privateKey);
+        console.log("Deployer:", deployer);
+
+        vm.startBroadcast(n.privateKey);
+
+        NatecinFactory factory = new NatecinFactory();
+        VaultRegistry registry = new VaultRegistry(address(factory));
+
+        factory.setVaultRegistry(address(registry));
+
+        vm.stopBroadcast();
+
+        console.log("Factory:", address(factory));
+        console.log("Registry:", address(registry));
+    }
+}

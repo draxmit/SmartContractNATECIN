@@ -1,0 +1,26 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.30;
+
+import "forge-std/Script.sol";
+import "../../src/VaultRegistry.sol";
+
+contract ManualChainlinkUpkeep is Script {
+    function run() external {
+        address registryCA = vm.envAddress("REGISTRY_ADDRESS");
+        VaultRegistry reg = VaultRegistry(registryCA);
+
+        (bool needed, bytes memory data) = reg.checkUpkeep("");
+
+        console.log("Upkeep Needed:", needed);
+
+        if (needed) {
+            vm.startBroadcast(vm.envUint("PRIVATE_KEY"));
+            reg.performUpkeep(data);
+            vm.stopBroadcast();
+
+            console.log("Upkeep Executed!");
+        } else {
+            console.log("No upkeep required.");
+        }
+    }
+}

@@ -1,0 +1,33 @@
+# Foundry
+out/
+cache/
+broadcast/
+
+# Environment
+.env
+.env.local
+.env.production
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+.AppleDouble
+.LSOverride
+
+# Node / frontend
+node_modules/
+
+# Coverage
+coverage/
+lcov.info
+.coverage_cache/
+
+# Docs build artifacts
+docs/book/
