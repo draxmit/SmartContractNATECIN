@@ -1,8 +1,9 @@
+
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.30;
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
-import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol"; //
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import "./NatecinVault.sol";
 
 interface IVaultRegistry {
@@ -20,9 +21,14 @@ contract NatecinFactory is Ownable {
 
     // ============ STATE VARIABLES ============
 
-    address public immutable implementation; // The "Master" logic contract
+    address public immutable implementation;
     address[] public allVaults;
-    address public vaultRegistry;  // Integrated registry
+    address public vaultRegistry;
+    
+    // Fee configuration - percentage based
+    uint256 public creationFeePercent = 40; // 0.4% = 40 basis points (out of 10000)
+    uint256 public constant MAX_CREATION_FEE_PERCENT = 200; // Max 2%
+    address public feeCollector;
     
     // Mappings for easy discovery
     mapping(address => address[]) public vaultsByOwner;
@@ -37,8 +43,13 @@ contract NatecinFactory is Ownable {
         address indexed owner,
         address indexed heir,
         uint256 inactivityPeriod,
-        uint256 timestamp
+        uint256 timestamp,
+        uint256 depositAmount,
+        uint256 feeAmount
     );
+    event CreationFeeUpdated(uint256 oldFee, uint256 newFee);
+    event FeeCollectorUpdated(address indexed oldCollector, address indexed newCollector);
+    event FeesWithdrawn(address indexed to, uint256 amount);
 
     // ============ ERRORS ============
 
@@ -46,19 +57,62 @@ contract NatecinFactory is Ownable {
     error InvalidPeriod();
     error VaultCreationFailed();
     error NotVault();
+    error InsufficientValue();
+    error WithdrawalFailed();
+    error InvalidFeePercent();
 
     // ============ CONSTRUCTOR ============
 
     constructor() Ownable(msg.sender) {
-        // Deploy the Master Copy ONCE.
-        // We pass empty/dummy values because this instance is only used for logic,
-        // never for storage.
-        implementation = address(new NatecinVault()); //
+        implementation = address(new NatecinVault());
+        feeCollector = msg.sender; // Default to deployer
+    }
+
+    // ============ FEE MANAGEMENT ============
+
+    /**
+     * @notice Update vault creation fee percentage
+     * @param newFeePercent New fee in basis points (40 = 0.4%)
+     */
+    function setCreationFee(uint256 newFeePercent) external onlyOwner {
+        if (newFeePercent > MAX_CREATION_FEE_PERCENT) revert InvalidFeePercent();
+        uint256 oldFee = creationFeePercent;
+        creationFeePercent = newFeePercent;
+        emit CreationFeeUpdated(oldFee, newFeePercent);
+    }
+
+    /**
+     * @notice Update fee collector address
+     * @param newCollector New fee collector address
+     */
+    function setFeeCollector(address newCollector) external onlyOwner {
+        if (newCollector == address(0)) revert ZeroAddress();
+        address oldCollector = feeCollector;
+        feeCollector = newCollector;
+        emit FeeCollectorUpdated(oldCollector, newCollector);
+    }
+
+    /**
+     * @notice Withdraw collected fees
+     */
+    function withdrawFees() external onlyOwner {
+        uint256 balance = address(this).balance;
+        (bool success, ) = feeCollector.call{value: balance}("");
+        if (!success) revert WithdrawalFailed();
+        emit FeesWithdrawn(feeCollector, balance);
+    }
+
+    /**
+     * @notice Calculate creation fee for a given deposit amount
+     * @param depositAmount The amount being deposited
+     * @return fee The calculated fee amount
+     */
+    function calculateCreationFee(uint256 depositAmount) public view returns (uint256 fee) {
+        fee = (depositAmount * creationFeePercent) / 10000;
     }
 
     // ============ REGISTRY CONFIG ============
 
-    /// @notice Set the external vault registry (onlyOwner)
     function setVaultRegistry(address _registry) external onlyOwner {
         vaultRegistry = _registry;
     }
@@ -77,36 +131,40 @@ contract NatecinFactory is Ownable {
         returns (address vault)
     {
         if (heir == address(0)) revert ZeroAddress();
+        if (msg.value == 0) revert InsufficientValue();
         
         // Sanity check: 1 day min, 10 years max
         if (inactivityPeriod < 1 days || inactivityPeriod > 3650 days) {
             revert InvalidPeriod();
         }
 
-        // --- 1. Create Clone (Cheap!) ---
-        // We use a salt based on msg.sender so addresses are deterministic
+        // Calculate fee based on deposit amount (0.4% of msg.value)
+        uint256 fee = calculateCreationFee(msg.value);
+        uint256 depositAmount = msg.value - fee;
+
+        // Create Clone
         bytes32 salt = keccak256(abi.encodePacked(msg.sender, allVaults.length));
-        vault = implementation.cloneDeterministic(salt); //
+        vault = implementation.cloneDeterministic(salt);
 
         if (vault == address(0)) revert VaultCreationFailed();
 
-        // --- 2. Initialize the Clone ---
-        // Proxies don't run constructors, so we call initialize()
-        NatecinVault(payable(vault)).initialize{value: msg.value}(
+        // Initialize the Clone with deposit amount (after fee)
+        NatecinVault(payable(vault)).initialize{value: depositAmount}(
             msg.sender, 
             heir, 
-            inactivityPeriod
+            inactivityPeriod,
+            vaultRegistry
         );
 
-        // --- 3. Track vault ---
+        // Track vault
         allVaults.push(vault);
         vaultsByOwner[msg.sender].push(vault);
         vaultsByHeir[heir].push(vault);
         isVault[vault] = true;
 
-        emit VaultCreated(vault, msg.sender, heir, inactivityPeriod, block.timestamp);
+        emit VaultCreated(vault, msg.sender, heir, inactivityPeriod, block.timestamp, depositAmount, fee);
 
-        // --- 4. Auto-register with Registry (if set) ---
+        // Auto-register with Registry (if set)
         if (vaultRegistry != address(0)) {
             IVaultRegistry(vaultRegistry).registerVault(vault);
             emit VaultRegistered(vault, vaultRegistry);
@@ -129,9 +187,6 @@ contract NatecinFactory is Ownable {
         return vaultsByHeir[heir];
     }
 
-    /**
-     * @notice Paginated getter for frontend UI
-     */
     function getVaults(uint256 offset, uint256 limit)
         external
         view
@@ -158,9 +213,6 @@ contract NatecinFactory is Ownable {
         return isVault[vault];
     }
 
-    /**
-     * @notice Helper to get vault data without needing the Vault ABI on frontend
-     */
     function getVaultDetails(address vault)
         external
         view

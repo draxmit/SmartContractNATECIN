@@ -8,10 +8,6 @@ import "../src/NatecinVault.sol";
 import "../src/VaultRegistry.sol";
 
 contract NatecinFactoryTest is Test {
-    // ------------------------------------------------------------
-    // State
-    // ------------------------------------------------------------
-
     NatecinFactory public factory;
     VaultRegistry public registry;
 
@@ -22,23 +18,17 @@ contract NatecinFactoryTest is Test {
 
     uint256 public constant PERIOD = 90 days;
 
-    // ------------------------------------------------------------
-    // Events
-    // ------------------------------------------------------------
-
     event VaultCreated(
         address indexed vault,
         address indexed owner,
         address indexed heir,
         uint256 inactivityPeriod,
-        uint256 timestamp
+        uint256 timestamp,
+        uint256 depositAmount,
+        uint256 feeAmount
     );
 
     event VaultRegistered(address indexed vault, address indexed registry);
-
-    // ------------------------------------------------------------
-    // Setup
-    // ------------------------------------------------------------
 
     function setUp() public {
         factory = new NatecinFactory();
@@ -51,35 +41,32 @@ contract NatecinFactoryTest is Test {
         vm.deal(user1, 100 ether);
         vm.deal(user2, 100 ether);
 
-        // Deploy registry linked to factory
         registry = new VaultRegistry(address(factory));
 
-        // Link factory to registry
         vm.prank(address(this));
         factory.setVaultRegistry(address(registry));
     }
 
-    // ------------------------------------------------------------
-    // Vault Creation
-    // ------------------------------------------------------------
-
     function test_CreateVault() public {
+        uint256 depositAmount = 1 ether;
+        uint256 expectedFee = (depositAmount * 40) / 10000;
+        uint256 expectedVaultBalance = depositAmount - expectedFee;
+        
         vm.prank(user1);
 
-        // Expect VaultCreated
         vm.expectEmit(false, true, true, true);
-        emit VaultCreated(address(0), user1, heir1, PERIOD, block.timestamp);
+        emit VaultCreated(address(0), user1, heir1, PERIOD, block.timestamp, expectedVaultBalance, expectedFee);
 
-        // Expect VaultRegistered
         vm.expectEmit(false, true, false, true);
         emit VaultRegistered(address(0), address(registry));
 
-        address vault = factory.createVault{value: 1 ether}(heir1, PERIOD);
+        address vault = factory.createVault{value: depositAmount}(heir1, PERIOD);
 
         assertTrue(factory.isValidVault(vault));
         assertEq(factory.totalVaults(), 1);
+        assertEq(address(vault).balance, expectedVaultBalance);
+        assertEq(address(factory).balance, expectedFee);
 
-        // Check registry using the struct getter (owner, heir, active)
         (,,bool active) = registry.vaultInfo(vault);
         assertTrue(active, "Vault should be active in registry");
     }
@@ -107,12 +94,7 @@ contract NatecinFactoryTest is Test {
         assertEq(hv[0], v);
     }
 
-    // ------------------------------------------------------------
-    // Pagination
-    // ------------------------------------------------------------
-
     function test_GetVaults_Pagination() public {
-        // create 5 vaults
         for (uint256 i = 0; i < 5; i++) {
             vm.prank(user1);
             factory.createVault{value: 1 ether}(heir1, PERIOD);
@@ -127,13 +109,13 @@ contract NatecinFactoryTest is Test {
         assertEq(total2, 5);
     }
 
-    // ------------------------------------------------------------
-    // Vault Details
-    // ------------------------------------------------------------
-
     function test_GetVaultDetails() public {
+        uint256 depositAmount = 5 ether;
+        uint256 fee = (depositAmount * 40) / 10000;
+        uint256 expectedBalance = depositAmount - fee;
+        
         vm.prank(user1);
-        address vault = factory.createVault{value: 5 ether}(heir1, PERIOD);
+        address vault = factory.createVault{value: depositAmount}(heir1, PERIOD);
 
         (
             address own,
@@ -148,39 +130,83 @@ contract NatecinFactoryTest is Test {
         assertEq(own, user1);
         assertEq(hr, heir1);
         assertEq(per, PERIOD);
-        assertEq(ethBalance, 5 ether);
+        assertEq(ethBalance, expectedBalance);
         assertFalse(executed);
         assertFalse(canDistribute);
-
         assertEq(lastActive, block.timestamp);
     }
-
-    // ------------------------------------------------------------
-    // Invalid Inputs
-    // ------------------------------------------------------------
 
     function test_Revert_ZeroHeir() public {
         vm.prank(user1);
         vm.expectRevert(NatecinFactory.ZeroAddress.selector);
-        factory.createVault(address(0), PERIOD);
+        factory.createVault{value: 1 ether}(address(0), PERIOD);
+    }
+
+    function test_Revert_ZeroValue() public {
+        vm.prank(user1);
+        vm.expectRevert(NatecinFactory.InsufficientValue.selector);
+        factory.createVault(heir1, PERIOD);
     }
 
     function test_Revert_InvalidPeriod_Short() public {
         vm.prank(user1);
         vm.expectRevert(NatecinFactory.InvalidPeriod.selector);
-        factory.createVault(heir1, 1 hours); // Min is 1 day
+        factory.createVault{value: 1 ether}(heir1, 1 hours);
     }
 
     function test_Revert_InvalidPeriod_Long() public {
         vm.prank(user1);
         vm.expectRevert(NatecinFactory.InvalidPeriod.selector);
-        // Max is 10 years (approx 3650 days). 20 years should fail.
-        factory.createVault(heir1, 20 * 365 days);
+        factory.createVault{value: 1 ether}(heir1, 20 * 365 days);
     }
 
-    // ------------------------------------------------------------
-    // Registry Auto-Integration
-    // ------------------------------------------------------------
+    function test_CalculateCreationFee() public view {
+        assertEq(factory.calculateCreationFee(1 ether), 0.004 ether); // 0.4%
+        assertEq(factory.calculateCreationFee(10 ether), 0.04 ether);
+        assertEq(factory.calculateCreationFee(100 ether), 0.4 ether);
+    }
+
+    function test_SetCreationFee() public {
+        uint256 newFee = 60; // 0.6%
+        
+        vm.prank(address(this));
+        factory.setCreationFee(newFee);
+        
+        assertEq(factory.creationFeePercent(), newFee);
+    }
+
+    function test_Revert_SetCreationFee_TooHigh() public {
+        uint256 tooHighFee = 300; // 3% (max is 2%)
+        
+        vm.prank(address(this));
+        vm.expectRevert(NatecinFactory.InvalidFeePercent.selector);
+        factory.setCreationFee(tooHighFee);
+    }
+
+    function test_WithdrawFees() public {
+        // 1. Setup a dedicated collector address
+        address collector = makeAddr("collector");
+        
+        // 2. Update the factory to use this collector
+        vm.prank(address(this));
+        factory.setFeeCollector(collector);
+
+        vm.startPrank(user1);
+        factory.createVault{value: 1 ether}(heir1, PERIOD);
+        factory.createVault{value: 2 ether}(heir1, PERIOD);
+        vm.stopPrank();
+        
+        uint256 totalFees = factory.calculateCreationFee(1 ether) + factory.calculateCreationFee(2 ether);
+        assertEq(address(factory).balance, totalFees);
+        
+        uint256 collectorBalanceBefore = collector.balance;
+        
+        vm.prank(address(this));
+        factory.withdrawFees();
+        
+        assertEq(collector.balance, collectorBalanceBefore + totalFees);
+        assertEq(address(factory).balance, 0);
+    }
 
     function test_Registry_AutoRegistersVault() public {
         vm.prank(user1);
@@ -197,7 +223,6 @@ contract NatecinFactoryTest is Test {
         address v3 = factory.createVault{value: 1 ether}(heir1, PERIOD);
         vm.stopPrank();
 
-        // registry uses push order → should match array access
         assertEq(registry.vaults(0), v1);
         assertEq(registry.vaults(1), v2);
         assertEq(registry.vaults(2), v3);

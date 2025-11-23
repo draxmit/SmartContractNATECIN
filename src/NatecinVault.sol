@@ -7,49 +7,42 @@ import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
 
 /**
  * @title NatecinVault
  * @author NATECIN Team
  * @notice Automated blockchain-based inheritance vault system
- * @dev Supports ETH, ERC20, ERC721, ERC1155 with Chainlink Automation
+ * @dev Supports ETH, ERC20, ERC721, ERC1155 - Automation handled by VaultRegistry
  */
 contract NatecinVault is 
-    AutomationCompatibleInterface,
     IERC721Receiver,
     IERC1155Receiver,
     ReentrancyGuard
 {
     // ============ STATE VARIABLES ============
     
-    // [CHANGE 1] Removed 'immutable'. Clones need to write this to their own storage.
     address public owner; 
     address public heir;
     uint256 public inactivityPeriod;
     uint256 public lastActiveTimestamp;
     bool public executed;
+    address public registry; // Added to track registry for fee payment
     
-    // [CHANGE 2] Initialization flag for Clones
     bool private _initialized;
 
-    // Minimum and maximum inactivity periods
     uint256 public constant MIN_INACTIVITY_PERIOD = 1 seconds;
-    uint256 public constant MAX_INACTIVITY_PERIOD = 10 * 365 days; // 10 years
+    uint256 public constant MAX_INACTIVITY_PERIOD = 10 * 365 days;
     
     // ============ ASSET TRACKING ============
     
-    // ERC20 tokens
     address[] private erc20Tokens;
     mapping(address => bool) private erc20Exists;
     
-    // ERC721 NFTs (collection => tokenIds[])
     mapping(address => uint256[]) private erc721TokenIds;
     mapping(address => mapping(uint256 => bool)) private erc721TokenExists;
     address[] private erc721Collections;
     mapping(address => bool) private erc721CollectionExists;
     
-    // ERC1155 multi-tokens (collection => id => amount)
     mapping(address => mapping(uint256 => uint256)) private erc1155Balances;
     mapping(address => uint256[]) private erc1155TokenIds;
     mapping(address => mapping(uint256 => bool)) private erc1155TokenExists;
@@ -84,7 +77,7 @@ contract NatecinVault is
     event ERC721Deposited(address indexed collection, uint256 tokenId);
     event ERC1155Deposited(address indexed collection, uint256 id, uint256 amount);
     
-    event AssetsDistributed(address indexed heir, uint256 timestamp);
+    event AssetsDistributed(address indexed heir, uint256 timestamp, uint256 feeAmount);
     event ETHDistributed(address indexed heir, uint256 amount);
     event ERC20Distributed(address indexed token, address indexed heir, uint256 amount);
     event ERC721Distributed(address indexed collection, address indexed heir, uint256 tokenId);
@@ -107,7 +100,7 @@ contract NatecinVault is
     error ZeroAmount();
     error TransferFailed();
     error NoAssets();
-    error AlreadyInitialized(); // [CHANGE 3] New Error
+    error AlreadyInitialized();
     
     // ============ MODIFIERS ============
     
@@ -123,50 +116,38 @@ contract NatecinVault is
     
     // ============ CONSTRUCTOR & INITIALIZER ============
     
-    /**
-     * @dev The constructor only runs on the "Master" implementation.
-     * We set _initialized = true to prevent anyone from initializing the Master.
-     */
     constructor() {
         _initialized = true; 
     }
 
-    /**
-     * @dev Replaces the constructor for Clones. Called immediately after cloning.
-     * @param _owner The vault owner
-     * @param _heir The beneficiary
-     * @param _inactivityPeriod Time before distribution
-     */
     function initialize(
         address _owner, 
         address _heir, 
-        uint256 _inactivityPeriod
+        uint256 _inactivityPeriod,
+        address _registry // <--- ADD THIS PARAMETER
     ) external payable {
-        // 1. Security check
         if (_initialized) revert AlreadyInitialized();
         _initialized = true;
 
-        // 2. Validation
         if (_owner == address(0)) revert ZeroAddress();
         if (_heir == address(0)) revert ZeroAddress();
         if (_inactivityPeriod < MIN_INACTIVITY_PERIOD || 
             _inactivityPeriod > MAX_INACTIVITY_PERIOD) revert InvalidPeriod();
-        
-        // 3. Set State
+
         owner = _owner;
         heir = _heir;
         inactivityPeriod = _inactivityPeriod;
         lastActiveTimestamp = block.timestamp;
         executed = false;
         
-        emit VaultCreated(owner, heir, inactivityPeriod, block.timestamp);
+        // FIX: Set registry to the passed address, not msg.sender
+        registry = _registry; 
         
-        // 4. Handle initial ETH deposit
+        emit VaultCreated(owner, heir, inactivityPeriod, block.timestamp);
         if (msg.value > 0) {
             emit ETHDeposited(msg.sender, msg.value);
         }
     }
-
     
     // ============ VIEW FUNCTIONS ============
     
@@ -211,9 +192,6 @@ contract NatecinVault is
             timeUntilDistribution()
         );
     }
-    
-    // ... [Rest of the file remains exactly the same] ...
-    // (Asset getters, Owner functions, Deposit functions, Distribution functions)
     
     function getERC20Tokens() external view returns (address[] memory) {
         return erc20Tokens;
@@ -285,6 +263,17 @@ contract NatecinVault is
         }
     }
     
+    function depositETH() external payable notExecuted {
+        if (msg.value == 0) revert ZeroAmount();
+
+        emit ETHDeposited(msg.sender, msg.value);
+
+        if (msg.sender == owner) {
+            lastActiveTimestamp = block.timestamp;
+            emit ActivityUpdated(lastActiveTimestamp);
+        }
+    }
+    
     function depositERC20(address token, uint256 amount) 
         external 
         onlyOwner 
@@ -340,23 +329,51 @@ contract NatecinVault is
     
     // ============ DISTRIBUTION FUNCTIONS ============
     
+    /**
+     * @notice Distribute assets to heir with fee collection
+     * @dev Calculates fee based on registry's distributionFeePercent
+     */
     function distributeAssets() external notExecuted nonReentrant {
         if (!canDistribute()) revert StillActive();
         
         executed = true;
         
         bool hasAssets = false;
+        uint256 feeAmount = 0;
         
-        // Distribute ETH
+        // Distribute ETH with fee deduction
         uint256 ethBalance = address(this).balance;
         if (ethBalance > 0) {
             hasAssets = true;
-            (bool success, ) = payable(heir).call{value: ethBalance}("");
-            if (!success) revert TransferFailed();
-            emit ETHDistributed(heir, ethBalance);
+            
+            // Get fee from registry if possible
+            uint256 fee = 0;
+            try IVaultRegistryFee(registry).distributionFeePercent() returns (uint256 feePercent) {
+                if (feePercent > 0) {
+                    fee = (ethBalance * feePercent) / 10000;
+                    feeAmount = fee;
+                }
+            } catch {
+                // If registry call fails, no fee
+            }
+            
+            uint256 amountToHeir = ethBalance - fee;
+            
+            // Transfer to heir
+            if (amountToHeir > 0) {
+                (bool success, ) = payable(heir).call{value: amountToHeir}("");
+                if (!success) revert TransferFailed();
+                emit ETHDistributed(heir, amountToHeir);
+            }
+            
+            // Transfer fee to registry
+            if (fee > 0) {
+                (bool success, ) = payable(registry).call{value: fee}("");
+                // If fee transfer fails, continue (don't revert entire distribution)
+            }
         }
         
-        // Distribute ERC20 tokens
+        // Distribute ERC20 tokens (no fee on tokens, only ETH)
         for (uint256 i = 0; i < erc20Tokens.length; i++) {
             address token = erc20Tokens[i];
             uint256 balance = IERC20(token).balanceOf(address(this));
@@ -410,7 +427,82 @@ contract NatecinVault is
         
         if (!hasAssets) revert NoAssets();
         
-        emit AssetsDistributed(heir, block.timestamp);
+        emit AssetsDistributed(heir, block.timestamp, feeAmount);
+    }
+
+    // ============ WITHDRAW FUNCTIONS ============
+    
+    function withdrawETH(address payable to, uint256 amount)
+        external
+        onlyOwner
+        notExecuted
+        nonReentrant
+    {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        if (amount > address(this).balance) revert NoAssets();
+
+        (bool success, ) = to.call{value: amount}("");
+        if (!success) revert TransferFailed();
+
+        lastActiveTimestamp = block.timestamp;
+        emit ActivityUpdated(lastActiveTimestamp);
+    }
+
+    function withdrawERC20(address token, address to, uint256 amount)
+        external
+        onlyOwner
+        notExecuted
+        nonReentrant
+    {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+
+        bool success = IERC20(token).transfer(to, amount);
+        if (!success) revert TransferFailed();
+
+        lastActiveTimestamp = block.timestamp;
+        emit ActivityUpdated(lastActiveTimestamp);
+    }
+
+    function withdrawERC721(address collection, address to, uint256 tokenId)
+        external
+        onlyOwner
+        notExecuted
+    {
+        if (to == address(0)) revert ZeroAddress();
+
+        IERC721(collection).safeTransferFrom(address(this), to, tokenId);
+
+        lastActiveTimestamp = block.timestamp;
+        emit ActivityUpdated(lastActiveTimestamp);
+    }
+
+    function withdrawERC1155(
+        address collection,
+        address to,
+        uint256 id,
+        uint256 amount,
+        bytes calldata data
+    )
+        external
+        onlyOwner
+        notExecuted
+        nonReentrant
+    {
+        if (to == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+
+        IERC1155(collection).safeTransferFrom(
+            address(this),
+            to,
+            id,
+            amount,
+            data
+        );
+
+        lastActiveTimestamp = block.timestamp;
+        emit ActivityUpdated(lastActiveTimestamp);
     }
     
     function emergencyWithdraw() external onlyOwner notExecuted nonReentrant {
@@ -470,23 +562,6 @@ contract NatecinVault is
         }
         
         emit EmergencyWithdrawal(owner, block.timestamp);
-    }
-    
-    // ============ CHAINLINK AUTOMATION ============
-    
-    function checkUpkeep(bytes calldata /* checkData */)
-        external
-        view
-        override
-        returns (bool upkeepNeeded, bytes memory /* performData */)
-    {
-        upkeepNeeded = canDistribute();
-    }
-    
-    function performUpkeep(bytes calldata /* performData */) external override {
-        if (canDistribute()) {
-            this.distributeAssets();
-        }
     }
     
     // ============ ERC721 RECEIVER ============
@@ -579,4 +654,9 @@ contract NatecinVault is
             interfaceId == type(IERC721Receiver).interfaceId ||
             interfaceId == type(IERC1155Receiver).interfaceId;
     }
+}
+
+// Interface for registry fee query
+interface IVaultRegistryFee {
+    function distributionFeePercent() external view returns (uint256);
 }

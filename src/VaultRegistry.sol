@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity ^0.8.30;
 
-import "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
 import "./NatecinVault.sol";
 
-contract VaultRegistry is AutomationCompatibleInterface {
+contract VaultRegistry {
     // ====================================================
     //                      STATE
     // ====================================================
@@ -15,14 +14,20 @@ contract VaultRegistry is AutomationCompatibleInterface {
         bool active;
     }
 
-    address[] public vaults;                            // active vaults
-    mapping(address => VaultInfo) public vaultInfo;     // metadata
-    mapping(address => uint256) public vaultIndex;      // for swap & pop
-    
-    address public immutable factory;                   // <— Added to allow factory registration
+    address[] public vaults;
+    mapping(address => VaultInfo) public vaultInfo;
+    mapping(address => uint256) public vaultIndex;
+
+    address public immutable factory;
+    address public owner;
 
     uint256 public lastCheckedIndex;
     uint256 public constant BATCH_SIZE = 20;
+
+    // Fee configuration
+    uint256 public distributionFeePercent = 20; // 0.2%
+    uint256 public constant MAX_FEE_PERCENT = 500; // Max 5%
+    address public feeCollector;
 
     // ====================================================
     //                      EVENTS
@@ -30,8 +35,11 @@ contract VaultRegistry is AutomationCompatibleInterface {
 
     event VaultRegistered(address indexed vault, address indexed owner, address indexed heir);
     event VaultUnregistered(address indexed vault);
-    event VaultDistributed(address indexed vault, address indexed heir);
+    event VaultDistributed(address indexed vault, address indexed heir, uint256 feeCollected);
     event BatchProcessed(uint256 startIndex, uint256 endIndex, uint256 distributed);
+    event DistributionFeeUpdated(uint256 oldFee, uint256 newFee);
+    event FeeCollectorUpdated(address indexed oldCollector, address indexed newCollector);
+    event FeesWithdrawn(address indexed to, uint256 amount);
 
     // ====================================================
     //                      ERRORS
@@ -42,6 +50,17 @@ contract VaultRegistry is AutomationCompatibleInterface {
     error Unauthorized();
     error ZeroAddress();
     error VaultReadFailed();
+    error InvalidFeePercent();
+    error WithdrawalFailed();
+
+    // ====================================================
+    //                   MODIFIERS
+    // ====================================================
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert Unauthorized();
+        _;
+    }
 
     // ====================================================
     //                   CONSTRUCTOR
@@ -50,45 +69,68 @@ contract VaultRegistry is AutomationCompatibleInterface {
     constructor(address _factory) {
         if (_factory == address(0)) revert ZeroAddress();
         factory = _factory;
+        owner = msg.sender;
+        feeCollector = msg.sender;
+    }
+
+    // ====================================================
+    //                  FEE MANAGEMENT
+    // ====================================================
+
+    function setDistributionFee(uint256 newFeePercent) external onlyOwner {
+        if (newFeePercent > MAX_FEE_PERCENT) revert InvalidFeePercent();
+        uint256 oldFee = distributionFeePercent;
+        distributionFeePercent = newFeePercent;
+        emit DistributionFeeUpdated(oldFee, newFeePercent);
+    }
+
+    function setFeeCollector(address newCollector) external onlyOwner {
+        if (newCollector == address(0)) revert ZeroAddress();
+        address oldCollector = feeCollector;
+        feeCollector = newCollector;
+        emit FeeCollectorUpdated(oldCollector, newCollector);
+    }
+
+    function withdrawFees() external onlyOwner {
+        uint256 balance = address(this).balance;
+        (bool success, ) = feeCollector.call{value: balance}("");
+        if (!success) revert WithdrawalFailed();
+        emit FeesWithdrawn(feeCollector, balance);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert ZeroAddress();
+        owner = newOwner;
     }
 
     // ====================================================
     //                  REGISTRATION LOGIC
     // ====================================================
 
-    /**
-     * @dev Called by Factory (auto) or Owner (manual)
-     */
     function registerVault(address vault) external {
         if (vault == address(0)) revert ZeroAddress();
         if (vaultInfo[vault].active) revert AlreadyRegistered();
 
         NatecinVault v = NatecinVault(payable(vault));
-        address owner = v.owner();
+        address vaultOwner = v.owner();
         address heir = v.heir();
 
-        // Security: Only allow Factory or the Vault Owner to register
-        if (msg.sender != factory && msg.sender != owner) {
+        if (msg.sender != factory && msg.sender != vaultOwner) {
             revert Unauthorized();
         }
 
-        // Store metadata
         vaultIndex[vault] = vaults.length;
         vaults.push(vault);
-        vaultInfo[vault] = VaultInfo(owner, heir, true);
+        vaultInfo[vault] = VaultInfo(vaultOwner, heir, true);
 
-        emit VaultRegistered(vault, owner, heir);
+        emit VaultRegistered(vault, vaultOwner, heir);
     }
 
-    /**
-     * @dev Remove vault from tracking (Manual trigger)
-     */
     function unregisterVault(address vault) external {
         if (!vaultInfo[vault].active) revert NotRegistered();
-        
-        // Only allow Owner or Factory (in case of emergency) or Self
-        address owner = vaultInfo[vault].owner;
-        if (msg.sender != owner && msg.sender != factory && msg.sender != vault) {
+
+        address vaultOwner = vaultInfo[vault].owner;
+        if (msg.sender != vaultOwner && msg.sender != factory && msg.sender != vault) {
             revert Unauthorized();
         }
 
@@ -112,20 +154,51 @@ contract VaultRegistry is AutomationCompatibleInterface {
         emit VaultUnregistered(vault);
     }
 
+
     // ====================================================
-    //               CHAINLINK AUTOMATION
+    //                  GELATO AUTOMATION
+    // ====================================================
+    //
+    // Gelato pulls data OFF-CHAIN by calling:
+    //    checker()
+    //
+    // If canExec = true, Gelato will perform:
+    //    executeBatch(vaultsToProcess)
+    //
     // ====================================================
 
-    /**
-     * @dev Checks a batch of vaults to see if they are ready for distribution.
-     * @return upkeepNeeded True if any vault in batch is ready.
-     * @return performData Encoded list of vaults to distribute and next index.
-     */
-    function checkUpkeep(bytes calldata)
+    function getReadyVaults(uint256 start, uint256 end)
+        internal
+        view
+        returns (address[] memory list, uint256 count)
+    {
+        address[] memory temp = new address[](BATCH_SIZE);
+        count = 0;
+
+        for (uint256 i = start; i < end; i++) {
+            address vault = vaults[i];
+            try NatecinVault(payable(vault)).canDistribute() returns (bool can) {
+                if (can && !NatecinVault(payable(vault)).executed()) {
+                    temp[count] = vault;
+                    count++;
+                }
+            } catch {
+                continue;
+            }
+        }
+
+        list = new address[](count);
+        for (uint256 j = 0; j < count; j++) {
+            list[j] = temp[j];
+        }
+    }
+
+    // ========== RESOLVER ==========
+
+    function checker()
         external
         view
-        override
-        returns (bool upkeepNeeded, bytes memory performData)
+        returns (bool canExec, bytes memory execPayload)
     {
         uint256 len = vaults.length;
         if (len == 0) return (false, "");
@@ -134,69 +207,45 @@ contract VaultRegistry is AutomationCompatibleInterface {
         uint256 end = start + BATCH_SIZE;
         if (end > len) end = len;
 
-        // Use memory array to collect ready vaults
-        address[] memory ready = new address[](BATCH_SIZE);
-        uint256 count = 0;
+        (address[] memory ready, uint256 count) = getReadyVaults(start, end);
 
-        for (uint256 i = start; i < end; i++) {
-            address vault = vaults[i];
-            // Low-level static call to prevent revert from stopping the loop
-            try NatecinVault(payable(vault)).canDistribute() returns (bool can) {
-                if (can) {
-                     // Double check executed status to be safe
-                     if (!NatecinVault(payable(vault)).executed()) {
-                        ready[count] = vault;
-                        count++;
-                     }
-                }
-            } catch {
-                // If vault reverts (e.g. self-destructed or buggy), skip it
-                continue;
-            }
-        }
-
-        // Prepare return data
         if (count > 0) {
-            // Resize array to fit exact count
-            address[] memory out = new address[](count);
-            for (uint256 i = 0; i < count; i++) out[i] = ready[i];
-            return (true, abi.encode(out, end));
+            canExec = true;
+            execPayload = abi.encode(ready, end);
+        } else {
+            canExec = false;
+            execPayload = abi.encode(new address[](0), end);
         }
-
-        // No work needed, but advance the index
-        // Fixed: `new address` -> `new address[](0)`
-        return (false, abi.encode(new address[](0), end)); 
     }
 
-    /**
-     * @dev Distributes assets for the provided list of vaults.
-     */
-    function performUpkeep(bytes calldata performData) external override {
-        (address[] memory list, uint256 nextIndex) =
-            abi.decode(performData, (address[], uint256));
+    // ========== EXECUTOR (CALLED BY GELATO) ==========
 
+    function executeBatch(address[] calldata list, uint256 nextIndex) external {
         uint256 distributed = 0;
 
         for (uint256 i = 0; i < list.length; i++) {
             address vaultAddr = list[i];
             NatecinVault vault = NatecinVault(payable(vaultAddr));
 
-            // Validate again before execution
             if (vault.canDistribute() && !vault.executed()) {
+                uint256 vaultBalance = address(vaultAddr).balance;
+
                 try vault.distributeAssets() {
-                    emit VaultDistributed(vaultAddr, vault.heir());
+                    uint256 fee = 0;
+                    if (vaultBalance > 0 && distributionFeePercent > 0) {
+                        fee = (vaultBalance * distributionFeePercent) / 10000;
+                    }
+
+                    emit VaultDistributed(vaultAddr, vault.heir(), fee);
                     distributed++;
-                    
-                    // Auto-prune: Remove from registry after successful distribution
-                    // This keeps the registry clean and costs down
+
                     _unregisterVaultInternal(vaultAddr);
                 } catch {
-                    // If distribution fails, leave it in registry to try again later
+                    // retry later
                 }
             }
         }
 
-        // Update global index for Round-Robin checking
         lastCheckedIndex = nextIndex >= vaults.length ? 0 : nextIndex;
 
         emit BatchProcessed(lastCheckedIndex, nextIndex, distributed);
@@ -216,7 +265,6 @@ contract VaultRegistry is AutomationCompatibleInterface {
         returns (address[] memory result)
     {
         uint256 len = vaults.length;
-        // Fixed: `new address` -> `new address[](0)`
         if (offset >= len) return new address[](0);
 
         uint256 end = offset + limit;
@@ -231,7 +279,6 @@ contract VaultRegistry is AutomationCompatibleInterface {
     function getDistributableVaults() external view returns (address[] memory out) {
         uint256 count = 0;
 
-        // Pass 1: Count
         for (uint256 i = 0; i < vaults.length; i++) {
             NatecinVault v = NatecinVault(payable(vaults[i]));
             try v.canDistribute() returns (bool can) {
@@ -240,12 +287,11 @@ contract VaultRegistry is AutomationCompatibleInterface {
         }
 
         out = new address[](count);
-
-        // Pass 2: Populate
         uint256 idx = 0;
+
         for (uint256 i = 0; i < vaults.length; i++) {
             NatecinVault v = NatecinVault(payable(vaults[i]));
-             try v.canDistribute() returns (bool can) {
+            try v.canDistribute() returns (bool can) {
                 if (can && !v.executed()) {
                     out[idx] = vaults[i];
                     idx++;
@@ -253,4 +299,7 @@ contract VaultRegistry is AutomationCompatibleInterface {
             } catch {}
         }
     }
+
+    // Allow registry to receive ETH fees
+    receive() external payable {}
 }

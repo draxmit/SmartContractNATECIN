@@ -1,31 +1,19 @@
+###############################################
+#              COMPILATION SETTINGS
+###############################################
 [profile.default]
 src = "src"
 out = "out"
 libs = ["lib"]
+
 solc = "0.8.30"
 optimizer = true
 optimizer_runs = 200
+via_ir = true
+
 gas_reports = ["NatecinVault", "NatecinFactory"]
-via_ir = false
 
-# Remappings
-remappings = [
-    "@openzeppelin/=lib/openzeppelin-contracts/",
-    "@chainlink/=lib/chainlink-brownie-contracts/",
-    "forge-std/=lib/forge-std/src/"
-]
-
-# RPC endpoints
-[rpc_endpoints]
-sepolia = "${SEPOLIA_RPC_URL}"
-mainnet = "${MAINNET_RPC_URL}"
-
-# Etherscan
-[etherscan]
-sepolia = { key = "${ETHERSCAN_API_KEY}" }
-mainnet = { key = "${ETHERSCAN_API_KEY}" }
-
-# Test settings
+# TEST SETTINGS
 [profile.default.fuzz]
 runs = 256
 
@@ -33,3 +21,45 @@ runs = 256
 runs = 256
 depth = 15
 fail_on_revert = true
+
+
+###############################################
+#                 REMAPPINGS
+###############################################
+remappings = [
+    "@openzeppelin/=lib/openzeppelin-contracts/",
+    "@chainlink/=lib/chainlink-brownie-contracts/",
+    "forge-std/=lib/forge-std/src/"
+]
+
+
+###############################################
+#                  RPC ENDPOINTS
+###############################################
+[rpc_endpoints]
+sepolia = "${SEPOLIA_RPC_URL}"
+mainnet = "${MAINNET_RPC_URL}"
+lisk_sepolia = "${LISK_SEPOLIA_RPC_URL}"
+
+
+###############################################
+#        ETHERSCAN-LIKE VERIFIERS (OPTIONAL)
+#  (KEEP ONLY REAL ETHERSCAN NETWORKS!)
+###############################################
+[etherscan]
+sepolia = { key = "${ETHERSCAN_API_KEY}" }   # Real Etherscan
+mainnet = { key = "${ETHERSCAN_API_KEY}" }   # Real Etherscan
+
+# ⚠️ NO "lisk_sepolia" HERE.
+# It breaks Foundry verification because Blockscout ≠ Etherscan.
+
+
+###############################################
+#          BLOCKSCOUT VERIFIER (LISK)
+###############################################
+[profile.default.verifier]
+verifier = "blockscout"
+
+[profile.default.verifier.blockscout]
+api_url = "https://sepolia-blockscout.lisk.com/api"
+chain_id = 4202
