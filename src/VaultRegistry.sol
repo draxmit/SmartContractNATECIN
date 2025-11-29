@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.30;
 
+import "forge-std/console.sol";
 import "./NatecinVault.sol";
 
 contract VaultRegistry {
@@ -10,7 +11,6 @@ contract VaultRegistry {
 
     struct VaultInfo {
         address owner;
-        address heir;
         bool active;
     }
 
@@ -33,9 +33,9 @@ contract VaultRegistry {
     //                      EVENTS
     // ====================================================
 
-    event VaultRegistered(address indexed vault, address indexed owner, address indexed heir);
+    event VaultRegistered(address indexed vault, address indexed owner);
     event VaultUnregistered(address indexed vault);
-    event VaultDistributed(address indexed vault, address indexed heir, uint256 feeCollected);
+    event VaultDistributed(address indexed vault, uint256 feeCollected);
     event BatchProcessed(uint256 startIndex, uint256 endIndex, uint256 distributed);
     event DistributionFeeUpdated(uint256 oldFee, uint256 newFee);
     event FeeCollectorUpdated(address indexed oldCollector, address indexed newCollector);
@@ -93,7 +93,7 @@ contract VaultRegistry {
 
     function withdrawFees() external onlyOwner {
         uint256 balance = address(this).balance;
-        (bool success, ) = feeCollector.call{value: balance}("");
+        (bool success,) = feeCollector.call{value: balance}("");
         if (!success) revert WithdrawalFailed();
         emit FeesWithdrawn(feeCollector, balance);
     }
@@ -101,6 +101,11 @@ contract VaultRegistry {
     function transferOwnership(address newOwner) external onlyOwner {
         if (newOwner == address(0)) revert ZeroAddress();
         owner = newOwner;
+    }
+
+    function getVaultInfo(address vault) external view returns (address vaultOwner, bool active) {
+        VaultInfo memory info = vaultInfo[vault];
+        return (info.owner, info.active);
     }
 
     // ====================================================
@@ -113,7 +118,7 @@ contract VaultRegistry {
 
         NatecinVault v = NatecinVault(payable(vault));
         address vaultOwner = v.owner();
-        address heir = v.heir();
+        address[] memory vaultHeirs = v.getHeirs();
 
         if (msg.sender != factory && msg.sender != vaultOwner) {
             revert Unauthorized();
@@ -121,9 +126,18 @@ contract VaultRegistry {
 
         vaultIndex[vault] = vaults.length;
         vaults.push(vault);
-        vaultInfo[vault] = VaultInfo(vaultOwner, heir, true);
+        
+        // Store a copy of the heirs array in storage
+        // address[] storage heirsStorage = vaultInfo[vault].heirs; // Heirs not stored in registry
+        // No need to store heirs, retrieved from vault when needed
+        // for (uint256 i = 0; i < vaultHeirs.length; i++) {
+        //     heirsStorage.push(vaultHeirs[i]);
+        // }
+        
+        vaultInfo[vault].owner = vaultOwner;
+        vaultInfo[vault].active = true;
 
-        emit VaultRegistered(vault, vaultOwner, heir);
+        emit VaultRegistered(vault, vaultOwner);
     }
 
     function unregisterVault(address vault) external {
@@ -154,7 +168,6 @@ contract VaultRegistry {
         emit VaultUnregistered(vault);
     }
 
-
     // ====================================================
     //                  GELATO AUTOMATION
     // ====================================================
@@ -167,11 +180,7 @@ contract VaultRegistry {
     //
     // ====================================================
 
-    function getReadyVaults(uint256 start, uint256 end)
-        internal
-        view
-        returns (address[] memory list, uint256 count)
-    {
+    function getReadyVaults(uint256 start, uint256 end) internal view returns (address[] memory list, uint256 count) {
         address[] memory temp = new address[](BATCH_SIZE);
         count = 0;
 
@@ -195,11 +204,7 @@ contract VaultRegistry {
 
     // ========== RESOLVER ==========
 
-    function checker()
-        external
-        view
-        returns (bool canExec, bytes memory execPayload)
-    {
+    function checker() external view returns (bool canExec, bytes memory execPayload) {
         uint256 len = vaults.length;
         if (len == 0) return (false, "");
 
@@ -236,7 +241,8 @@ contract VaultRegistry {
                         fee = (vaultBalance * distributionFeePercent) / 10000;
                     }
 
-                    emit VaultDistributed(vaultAddr, vault.heir(), fee);
+                    address[] memory vaultHeirs = vault.getHeirs();
+                    emit VaultDistributed(vaultAddr, fee);
                     distributed++;
 
                     _unregisterVaultInternal(vaultAddr);
@@ -259,11 +265,7 @@ contract VaultRegistry {
         return vaults.length;
     }
 
-    function getVaults(uint256 offset, uint256 limit)
-        external
-        view
-        returns (address[] memory result)
-    {
+    function getVaults(uint256 offset, uint256 limit) external view returns (address[] memory result) {
         uint256 len = vaults.length;
         if (offset >= len) return new address[](0);
 

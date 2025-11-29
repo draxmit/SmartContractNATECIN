@@ -27,7 +27,8 @@ contract IntegrationTest is Test {
     event VaultCreated(
         address indexed vault,
         address indexed owner,
-        address indexed heir,
+        address[] heirs,
+        uint256[] percentages,
         uint256 inactivityPeriod,
         uint256 timestamp,
         uint256 depositAmount,
@@ -49,7 +50,7 @@ contract IntegrationTest is Test {
         bob = makeAddr("bob");
         charlie = makeAddr("charlie");
 
-        vm.deal(alice, 100 ether);
+        vm.deal(alice, 1000 ether);
 
         token.mint(alice, 1000 ether);
         nft.mint(alice, 1);
@@ -58,50 +59,54 @@ contract IntegrationTest is Test {
     }
 
     function test_Scenario1_SimpleETH() public {
-        vm.prank(alice);
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000; // 100%
 
+        vm.prank(alice);
         vm.expectEmit(false, true, true, true);
         emit VaultRegistered(address(0), address(registry));
 
-        address vaultAddr = factory.createVault{value: 5 ether}(bob, PERIOD);
+        address vaultAddr = factory.createVault{value: 5 ether}(heirs, percentages, PERIOD, 0);
         NatecinVault vault = NatecinVault(payable(vaultAddr));
 
         assertFalse(vault.canDistribute());
 
-        // Calculate expected vault balance after creation fee
-        uint256 creationFee = (5 ether * 40) / 10000; // 0.4%
+        uint256 creationFee = (5 ether * 20) / 10000; // 0.2%
         uint256 expectedVaultBalance = 5 ether - creationFee;
         assertEq(address(vault).balance, expectedVaultBalance);
 
         vm.warp(block.timestamp + PERIOD + 1);
 
-        // --- GELATO CHECKER ---
         (bool canExec, bytes memory execPayload) = registry.checker();
         assertTrue(canExec, "Gelato should detect executable vaults");
 
-        // Decode payload to verify and execute
         (address[] memory vaultsToExec, uint256 nextIndex) = abi.decode(execPayload, (address[], uint256));
-        
+
         uint256 bobBalanceBefore = bob.balance;
-        
-        // --- GELATO EXECUTION ---
+
         registry.executeBatch(vaultsToExec, nextIndex);
 
         assertTrue(vault.executed(), "Vault should be executed");
-        
-        // Calculate distribution fee (0.2%)
+
         uint256 distributionFee = (expectedVaultBalance * 20) / 10000;
         uint256 expectedToBob = expectedVaultBalance - distributionFee;
-        
+
         assertEq(bob.balance, bobBalanceBefore + expectedToBob, "Heir should receive ETH minus fees");
-        
-        (,,bool active) = registry.vaultInfo(vaultAddr);
+
+        (, bool active) = registry.getVaultInfo(vaultAddr);
         assertFalse(active, "Vault should be removed from active registry");
     }
 
     function test_Scenario2_MultiAsset() public {
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000;
+
         vm.prank(alice);
-        address vaultAddr = factory.createVault{value: 10 ether}(bob, PERIOD);
+        address vaultAddr = factory.createVault{value: 10 ether}(heirs, percentages, PERIOD, 0);
         NatecinVault vault = NatecinVault(payable(vaultAddr));
 
         vm.startPrank(alice);
@@ -113,102 +118,111 @@ contract IntegrationTest is Test {
 
         multiToken.setApprovalForAll(vaultAddr, true);
         vault.depositERC1155(address(multiToken), 1, 50, "");
+
+        vault.topUpFeeDeposit{value: 0.01 ether}();
         vm.stopPrank();
 
         vm.warp(block.timestamp + PERIOD + 1);
 
-        // --- GELATO CHECKER ---
         (bool canExec, bytes memory execPayload) = registry.checker();
         assertTrue(canExec);
-        
+
         uint256 bobBalanceBefore = bob.balance;
         uint256 vaultBalance = address(vaultAddr).balance;
-        
-        // Decode payload
+
         (address[] memory vaultsToExec, uint256 nextIndex) = abi.decode(execPayload, (address[], uint256));
 
-        // --- GELATO EXECUTION ---
         registry.executeBatch(vaultsToExec, nextIndex);
 
-        // Calculate fees
-        uint256 distributionFee = (vaultBalance * 20) / 10000; // 0.2%
-        uint256 expectedETH = vaultBalance - distributionFee;
-        
+        uint256 distributableBalance = vaultBalance - 0.01 ether;
+        uint256 distributionFee = (distributableBalance * 20) / 10000;
+        uint256 expectedETH = distributableBalance - distributionFee;
+
         assertEq(bob.balance, bobBalanceBefore + expectedETH);
-        assertEq(token.balanceOf(bob), 500 ether);
+        assertEq(token.balanceOf(bob), 499 ether);
         assertEq(nft.ownerOf(1), bob);
         assertEq(multiToken.balanceOf(bob, 1), 50);
 
-        (,,bool active) = registry.vaultInfo(vaultAddr);
+        (, bool active) = registry.getVaultInfo(vaultAddr);
         assertFalse(active);
     }
 
     function test_Scenario3_MultipleVaults() public {
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000;
+
         vm.startPrank(alice);
-        address v1 = factory.createVault{value: 1 ether}(bob, 30 days);
-        address v2 = factory.createVault{value: 2 ether}(bob, 90 days);
-        address v3 = factory.createVault{value: 3 ether}(bob, 180 days);
+        address v1 = factory.createVault{value: 1 ether}(heirs, percentages, 30 days, 0);
+        address v2 = factory.createVault{value: 2 ether}(heirs, percentages, 90 days, 0);
+        address v3 = factory.createVault{value: 3 ether}(heirs, percentages, 180 days, 0);
         vm.stopPrank();
 
         assertEq(factory.getVaultsByOwner(alice).length, 3);
 
         uint256 bobBalance = bob.balance;
 
-        // --- V1 Ready (31 days) ---
+        // V1 Ready (31 days)
         vm.warp(block.timestamp + 31 days);
-        
+
         uint256 v1Balance = address(v1).balance;
         uint256 v1Fee = (v1Balance * 20) / 10000;
         uint256 expectedV1 = v1Balance - v1Fee;
-        
+
         (bool canExec1, bytes memory payload1) = registry.checker();
         assertTrue(canExec1);
-        
+
         (address[] memory list1, uint256 idx1) = abi.decode(payload1, (address[], uint256));
         registry.executeBatch(list1, idx1);
 
         assertEq(bob.balance, bobBalance + expectedV1);
-        (,,bool active1) = registry.vaultInfo(v1);
+        (, bool active1) = registry.getVaultInfo(v1);
         assertFalse(active1);
 
-        // --- V2 Ready (60 days later -> Total 91 days) ---
+        // V2 Ready (60 days later -> Total 91 days)
         vm.warp(block.timestamp + 60 days);
-        
+
         uint256 v2Balance = address(v2).balance;
         uint256 v2Fee = (v2Balance * 20) / 10000;
         uint256 expectedV2 = v2Balance - v2Fee;
-        
+
         (bool canExec2, bytes memory payload2) = registry.checker();
         assertTrue(canExec2);
-        
+
         (address[] memory list2, uint256 idx2) = abi.decode(payload2, (address[], uint256));
         registry.executeBatch(list2, idx2);
 
         assertEq(bob.balance, bobBalance + expectedV1 + expectedV2);
-        (,,bool active2) = registry.vaultInfo(v2);
+        (, bool active2) = registry.getVaultInfo(v2);
         assertFalse(active2);
 
-        // --- V3 Ready (90 days later -> Total 181 days) ---
+        // V3 Ready (90 days later -> Total 181 days)
         vm.warp(block.timestamp + 90 days);
-        
+
         uint256 v3Balance = address(v3).balance;
         uint256 v3Fee = (v3Balance * 20) / 10000;
         uint256 expectedV3 = v3Balance - v3Fee;
-        
+
         (bool canExec3, bytes memory payload3) = registry.checker();
         assertTrue(canExec3);
-        
+
         (address[] memory list3, uint256 idx3) = abi.decode(payload3, (address[], uint256));
         registry.executeBatch(list3, idx3);
 
         assertEq(bob.balance, bobBalance + expectedV1 + expectedV2 + expectedV3);
-        (,,bool active3) = registry.vaultInfo(v3);
+        (, bool active3) = registry.getVaultInfo(v3);
         assertFalse(active3);
     }
 
     function test_Scenario4_EmergencyWithdraw() public {
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000;
+
         vm.prank(alice);
-        address vaultAddr = factory.createVault{value: 5 ether}(bob, PERIOD);
+        address vaultAddr = factory.createVault{value: 5 ether}(heirs, percentages, PERIOD, 0);
         NatecinVault vault = NatecinVault(payable(vaultAddr));
 
         vm.prank(alice);
@@ -218,16 +232,20 @@ contract IntegrationTest is Test {
 
         vm.warp(block.timestamp + PERIOD + 1);
 
-        // Gelato check should fail (return false) because vault is already executed
-        (bool canExec, ) = registry.checker();
+        (bool canExec,) = registry.checker();
         assertFalse(canExec);
     }
 
     function test_Scenario5_BatchProcessing() public {
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000;
+
         vm.startPrank(alice);
-        address v1 = factory.createVault{value: 1 ether}(bob, PERIOD);
-        address v2 = factory.createVault{value: 1 ether}(bob, PERIOD);
-        address v3 = factory.createVault{value: 1 ether}(bob, PERIOD);
+        address v1 = factory.createVault{value: 1 ether}(heirs, percentages, PERIOD, 0);
+        address v2 = factory.createVault{value: 1 ether}(heirs, percentages, PERIOD, 0);
+        address v3 = factory.createVault{value: 1 ether}(heirs, percentages, PERIOD, 0);
         vm.stopPrank();
 
         assertEq(registry.vaults(0), v1);
@@ -236,14 +254,12 @@ contract IntegrationTest is Test {
 
         vm.warp(block.timestamp + PERIOD + 1);
 
-        // --- GELATO CHECKER ---
         (bool canExec, bytes memory execPayload) = registry.checker();
         assertTrue(canExec);
 
         (address[] memory targets, uint256 nextIndex) = abi.decode(execPayload, (address[], uint256));
         assertEq(targets.length, 3, "Registry should batch all 3 vaults");
 
-        // --- GELATO EXECUTION ---
         registry.executeBatch(targets, nextIndex);
 
         assertTrue(NatecinVault(payable(v1)).executed());
@@ -254,14 +270,23 @@ contract IntegrationTest is Test {
     }
 
     function test_Scenario6_HeirChange() public {
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000;
+
         vm.prank(alice);
-        address vaultAddr = factory.createVault{value: 3 ether}(bob, PERIOD);
+        address vaultAddr = factory.createVault{value: 3 ether}(heirs, percentages, PERIOD, 0);
         NatecinVault vault = NatecinVault(payable(vaultAddr));
 
         vm.prank(alice);
-        vault.setHeir(charlie);
+        address[] memory newHeirs = new address[](1);
+        uint256[] memory newPercentages = new uint256[](1);
+        newHeirs[0] = charlie;
+        newPercentages[0] = 10000;
+        vault.setHeirs(newHeirs, newPercentages);
 
-        assertEq(vault.heir(), charlie);
+        assertEq(vault.getHeirs()[0], charlie);
 
         vm.warp(block.timestamp + PERIOD + 1);
 
@@ -269,11 +294,10 @@ contract IntegrationTest is Test {
         uint256 vaultBalance = address(vaultAddr).balance;
         uint256 fee = (vaultBalance * 20) / 10000;
         uint256 expected = vaultBalance - fee;
-        
-        // --- GELATO ---
+
         (bool canExec, bytes memory payload) = registry.checker();
         assertTrue(canExec);
-        
+
         (address[] memory list, uint256 idx) = abi.decode(payload, (address[], uint256));
         registry.executeBatch(list, idx);
 
@@ -282,8 +306,13 @@ contract IntegrationTest is Test {
     }
 
     function test_Scenario7_ActiveOwnerPreventsDistribution() public {
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000;
+
         vm.prank(alice);
-        address vaultAddr = factory.createVault{value: 5 ether}(bob, PERIOD);
+        address vaultAddr = factory.createVault{value: 5 ether}(heirs, percentages, PERIOD, 0);
         NatecinVault vault = NatecinVault(payable(vaultAddr));
 
         vm.warp(block.timestamp + 30 days);
@@ -295,22 +324,103 @@ contract IntegrationTest is Test {
 
         assertFalse(vault.canDistribute());
 
-        (bool canExec, ) = registry.checker();
+        (bool canExec,) = registry.checker();
         assertFalse(canExec);
     }
 
     function test_FeeCalculations() public {
         uint256 depositAmount = 10 ether;
-        
-        // Test creation fee calculation
         uint256 creationFee = factory.calculateCreationFee(depositAmount);
-        assertEq(creationFee, (depositAmount * 40) / 10000); // 0.4%
-        
+        assertEq(creationFee, (depositAmount * 20) / 10000); // 0.2%
+
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000;
+
         vm.prank(alice);
-        address vaultAddr = factory.createVault{value: depositAmount}(bob, PERIOD);
-        
+        address vaultAddr = factory.createVault{value: depositAmount}(heirs, percentages, PERIOD, 0);
+
         uint256 expectedVaultBalance = depositAmount - creationFee;
         assertEq(address(vaultAddr).balance, expectedVaultBalance);
         assertEq(address(factory).balance, creationFee);
+    }
+
+    function test_Scenario8_MultiHeirSplit() public {
+        address[] memory heirs = new address[](2);
+        heirs[0] = bob;
+        heirs[1] = charlie;
+        uint256[] memory percentages = new uint256[](2);
+        percentages[0] = 6000;
+        percentages[1] = 4000;
+
+        uint256 deposit = 10 ether;
+
+        vm.prank(alice);
+        address vaultAddr = factory.createVault{value: deposit}(heirs, percentages, PERIOD, 0);
+
+        vm.warp(block.timestamp + PERIOD + 1);
+
+        (bool canExec, bytes memory payload) = registry.checker();
+        assertTrue(canExec);
+        (address[] memory list, uint256 idx) = abi.decode(payload, (address[], uint256));
+        
+        uint256 bobBefore = bob.balance;
+        uint256 charlieBefore = charlie.balance;
+        uint256 vaultBal = address(vaultAddr).balance;
+        
+        registry.executeBatch(list, idx);
+
+        uint256 registryFee = (vaultBal * 20) / 10000;
+        uint256 netAmount = vaultBal - registryFee;
+        
+        uint256 expectedBob = (netAmount * 6000) / 10000;
+        uint256 expectedCharlie = (netAmount * 4000) / 10000;
+
+        assertEq(bob.balance, bobBefore + expectedBob, "Bob should get 60%");
+        assertEq(charlie.balance, charlieBefore + expectedCharlie, "Charlie should get 40%");
+    }
+
+    function test_Scenario9_PrePaidNFTFee() public {
+        uint256 estimatedNFTs = 5;
+        uint256 nftFee = factory.calculateMinNFTFee(estimatedNFTs);
+        uint256 deposit = 1 ether + nftFee;
+
+        address[] memory heirs = new address[](1);
+        uint256[] memory percentages = new uint256[](1);
+        heirs[0] = bob;
+        percentages[0] = 10000;
+
+        vm.prank(alice);
+        address vaultAddr = factory.createVault{value: deposit}(heirs, percentages, PERIOD, estimatedNFTs);
+        NatecinVault vault = NatecinVault(payable(vaultAddr));
+
+        assertEq(vault.feeDeposit(), nftFee);
+
+        vm.startPrank(alice);
+        for(uint i=0; i<5; i++) {
+            uint256 tokenId = 10 + i;
+            
+            nft.mint(alice, tokenId);
+            nft.approve(vaultAddr, tokenId);
+            nft.safeTransferFrom(alice, vaultAddr, tokenId);
+        }
+        vm.stopPrank();
+
+        vm.warp(block.timestamp + PERIOD + 1);
+
+        (bool canExec, bytes memory payload) = registry.checker();
+        assertTrue(canExec);
+        (address[] memory list, uint256 idx) = abi.decode(payload, (address[], uint256));
+        
+        uint256 registryBalBefore = address(registry).balance;
+
+        registry.executeBatch(list, idx);
+
+        uint256 liquidInVault = 0.998 ether; // 1 ether - 0.2% creation fee
+        uint256 distFee = (liquidInVault * 20) / 10000;
+        uint256 expectedGain = nftFee + distFee;
+
+        assertApproxEqAbs(address(registry).balance, registryBalBefore + expectedGain, 10);
     }
 }

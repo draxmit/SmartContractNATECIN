@@ -29,6 +29,13 @@ contract DeployNatecin is Script {
         // Connect Factory → Registry
         factory.setVaultRegistry(registryCA);
 
+        // Configure NFT fees (optional)
+        factory.setNFTFeeConfig(
+            0.001 ether, // Minimum fee per NFT
+            0.01 ether, // Maximum fee per NFT
+            0.001 ether // Default fee per NFT
+        );
+
         vm.stopBroadcast();
 
         console.log("========================================");

@@ -17,7 +17,8 @@ contract InteractVault is Script {
 
         (
             address owner,
-            address heir,
+            address[] memory heirs,
+            uint256[] memory percentages,
             uint256 inactivityPeriod,
             uint256 lastActive,
             bool executed,
@@ -30,7 +31,12 @@ contract InteractVault is Script {
         ) = vault.getVaultSummary();
 
         console.log("Owner:", owner);
-        console.log("Heir:", heir);
+        console.log("Heirs count:", heirs.length);
+        for (uint256 i = 0; i < heirs.length; i++) {
+            console.log("Heir", i);
+            console.log("  Address:", heirs[i]);
+            console.log("  Percentage:", percentages[i] / 100, "%");
+        }
         console.log("Inactive Period:", inactivityPeriod / 1 days, "days");
         console.log("Executed:", executed);
         console.log("ETH:", ethBalance / 1e18);
